@@ -1,0 +1,989 @@
+#!/bin/bash
+
+# RDP Connection Manager - Simple Working Version
+# Interactive CLI tool for managing FreeRDP connections
+
+# Resolve script directory so companion tools work even when invoked via alias
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+FREERDP_WRAPPER=""
+if [[ -x "$SCRIPT_DIR/freerdp-safe" ]]; then
+    FREERDP_WRAPPER="$SCRIPT_DIR/freerdp-safe"
+elif command -v freerdp-safe >/dev/null 2>&1; then
+    FREERDP_WRAPPER="$(command -v freerdp-safe)"
+fi
+
+CONFIG_DIR="$HOME/.config/rdp-manager"
+CONFIG_FILE="$CONFIG_DIR/connections.json"
+
+# Create config directory if it doesn't exist
+mkdir -p "$CONFIG_DIR"
+
+# Initialize config file if it doesn't exist
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "[]" > "$CONFIG_FILE"
+fi
+
+# Colors for better UX
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to display the main menu with arrow navigation
+show_main_menu() {
+    local selected=0
+    local options=(
+        "Connect to saved RDP instance"
+        "Add new RDP connection"
+        "Edit existing connection"
+        "Delete connection"
+        "List all connections"
+        "Exit"
+    )
+
+    while true; do
+        clear
+        echo -e "${BLUE}=== RDP Connection Manager ===${NC}"
+        echo
+        echo "Use ↑/↓ arrows to navigate, Enter to select:"
+        echo
+
+        for i in "${!options[@]}"; do
+            if [[ $i -eq $selected ]]; then
+                echo -e "${GREEN}● ${options[i]}${NC}"
+            else
+                echo -e "○ ${options[i]}"
+            fi
+        done
+
+        echo
+
+        # Read key input
+        read -rsn1 key
+        if [[ $key == $'\x1b' ]]; then
+            read -rsn2 key
+            case $key in
+                '[A') # Up arrow
+                    ((selected--))
+                    if [[ $selected -lt 0 ]]; then
+                        selected=$((${#options[@]} - 1))
+                    fi
+                    ;;
+                '[B') # Down arrow
+                    ((selected++))
+                    if [[ $selected -ge ${#options[@]} ]]; then
+                        selected=0
+                    fi
+                    ;;
+            esac
+        elif [[ $key == "" ]]; then # Enter key
+            choice=$((selected + 1))
+            break
+        elif [[ $key =~ ^[1-6]$ ]]; then # Number key
+            choice=$key
+            break
+        fi
+    done
+}
+
+# Function to read connections from JSON file
+read_connections() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cat "$CONFIG_FILE"
+    else
+        echo "[]"
+    fi
+}
+
+# Function to save connections to JSON file
+save_connections() {
+    echo "$1" > "$CONFIG_FILE"
+}
+
+# Ensure older connection entries get a clipboard_mode field for safer defaults
+migrate_clipboard_modes() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return
+    fi
+
+    local original migrated
+    original=$(cat "$CONFIG_FILE")
+    if ! migrated=$(echo "$original" | jq 'map(
+        if has("clipboard_mode") then
+            (.clipboard_mode as $mode |
+                if $mode == "remote-to-local" then
+                    . + {clipboard_mode: "isolated", clipboard: false}
+                elif ($mode == "isolated" or $mode == "disabled") then
+                    . + {clipboard: false}
+                else
+                    . + {clipboard: true}
+                end)
+        else
+            if (.clipboard == true) then
+                . + {clipboard_mode: "isolated", clipboard: false}
+            else
+                . + {clipboard_mode: "disabled", clipboard: false}
+            end
+        end
+    )' 2>/dev/null); then
+        return
+    fi
+
+    if [[ -n "$migrated" && "$migrated" != "$original" ]]; then
+        echo "$migrated" > "$CONFIG_FILE"
+    fi
+}
+
+# Function to validate IP address
+validate_ip() {
+    local ip=$1
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        return 0
+    elif [[ $ip =~ ^[a-zA-Z0-9.-]+$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to get native resolutions from system
+get_native_resolutions() {
+    if command -v xrandr &> /dev/null; then
+        # Get primary display resolution
+        primary_res=$(xrandr --query | grep -E "connected.*primary|connected.*\*" | head -1 | grep -oE "[0-9]+x[0-9]+" | head -1)
+        # Get all connected display resolutions
+        all_resolutions=($(xrandr --query | grep " connected" | grep -oE "[0-9]+x[0-9]+" | sort -u))
+
+        if [[ -n "$primary_res" ]]; then
+            echo "$primary_res"
+        elif [[ ${#all_resolutions[@]} -gt 0 ]]; then
+            echo "${all_resolutions[0]}"
+        else
+            echo "1920x1080"
+        fi
+    else
+        echo "1920x1080"
+    fi
+}
+
+# Function to get monitor information for multimonitor setup
+get_monitor_info() {
+    if command -v xrandr &> /dev/null; then
+        # Count connected monitors
+        monitor_count=$(xrandr --query | grep " connected" | wc -l)
+        # Get monitor IDs
+        monitor_ids=$(xrandr --listmonitors | tail -n +2 | awk '{print $1}' | tr -d ':' | tr '\n' ',' | sed 's/,$//')
+
+        echo "monitors:$monitor_count,ids:$monitor_ids"
+    else
+        echo "monitors:1,ids:0"
+    fi
+}
+
+# Determine a sensible initial window size; prefer the current Hyprland window.
+get_initial_window_size() {
+    if command -v hyprctl &> /dev/null; then
+        hypr_window=$(hyprctl -j activewindow 2>/dev/null)
+        if [[ -n "$hypr_window" ]]; then
+            width=$(echo "$hypr_window" | jq '.size[0]' 2>/dev/null)
+            height=$(echo "$hypr_window" | jq '.size[1]' 2>/dev/null)
+            if [[ "$width" =~ ^[0-9]+$ ]] && [[ "$height" =~ ^[0-9]+$ ]] && [[ $width -gt 200 ]] && [[ $height -gt 200 ]]; then
+                echo "${width}x${height}"
+                return
+            fi
+        fi
+    fi
+
+    # Fallback to a comfortable default for other environments
+    echo "1280x800"
+}
+
+# Function to add new connection
+add_connection() {
+    clear
+    echo -e "${BLUE}=== Add New RDP Connection ===${NC}"
+    echo
+
+    # Get connection name
+    while true; do
+        read -p "Connection name: " name
+        if [[ -n "$name" ]]; then
+            # Check if name already exists
+            existing=$(echo "$connections" | jq -r --arg name "$name" '.[] | select(.name == $name) | .name')
+            if [[ -n "$existing" ]]; then
+                echo -e "${RED}Connection name already exists!${NC}"
+            else
+                break
+            fi
+        else
+            echo -e "${RED}Connection name cannot be empty!${NC}"
+        fi
+    done
+
+    # Get host/IP
+    while true; do
+        read -p "Host/IP address: " host
+        if [[ -n "$host" ]] && validate_ip "$host"; then
+            break
+        else
+            echo -e "${RED}Please enter a valid IP address or hostname!${NC}"
+        fi
+    done
+
+    # Get port (default 3389)
+    read -p "Port (default 3389): " port
+    port=${port:-3389}
+
+    # Get username
+    read -p "Username (optional): " username
+
+    # Get password (optional, hidden input)
+    read -s -p "Password (optional, will be hidden): " password
+    echo
+
+    # Get resolution with native detection
+    native_res=$(get_native_resolutions)
+    echo
+    echo "Resolution options:"
+    echo "1. 1024x768"
+    echo "2. 1280x1024"
+    echo "3. 1440x900"
+    echo "4. 1920x1080"
+    echo "5. 2560x1440 (1440p)"
+    echo "6. Native resolution ($native_res)"
+    echo "7. Full screen with multimonitor support"
+    echo "8. Responsive windowed (auto-scales with window resize)"
+    echo "9. Smart fullscreen (all monitors with span)"
+    echo "10. Custom"
+    read -p "Choose resolution (1-10, default 8 for responsive): " res_choice
+    res_choice=${res_choice:-8}
+
+    case $res_choice in
+        1) resolution="1024x768" ;;
+        2) resolution="1280x1024" ;;
+        3) resolution="1440x900" ;;
+        4) resolution="1920x1080" ;;
+        5) resolution="2560x1440" ;;
+        6) resolution="$native_res" ;;
+        7) resolution="fullscreen" ;;
+        8) resolution="responsive" ;;
+        9) resolution="smart-fullscreen" ;;
+        10)
+            read -p "Enter custom resolution (e.g., 1600x900): " resolution
+            ;;
+        *) resolution="responsive" ;;
+    esac
+
+    # Color depth
+    echo
+    echo "Color depth options:"
+    echo "1. 8-bit (fastest, lowest quality)"
+    echo "2. 15-bit (good performance, decent quality)"
+    echo "3. 16-bit (balanced performance/quality)"
+    echo "4. 24-bit (best quality, slower)"
+    read -p "Choose color depth (1-4, default 2 for performance): " depth_choice
+    depth_choice=${depth_choice:-2}
+
+    case $depth_choice in
+        1) color_depth=8 ;;
+        2) color_depth=15 ;;
+        3) color_depth=16 ;;
+        4) color_depth=24 ;;
+        *) color_depth=15 ;;
+    esac
+
+    # Additional options
+    echo
+    echo "Additional options:"
+    read -p "Enable performance mode? (y/n, default y): " perf_mode
+    perf_mode=${perf_mode:-y}
+
+    read -p "Enable sound redirection? (y/n, default n): " sound
+    sound=${sound:-n}
+
+    read -p "Share clipboard with host? (y/n, default n): " clipboard
+    clipboard=${clipboard:-n}
+
+    local clipboard_mode
+    if [[ "$clipboard" =~ ^[Yy]$ ]]; then
+        echo
+        echo "Clipboard direction options:"
+        echo "1. Remote → local (copy from session to this machine)"
+        echo "2. Local → remote only"
+        echo "3. Bidirectional (may be unstable)"
+        read -p "Choose clipboard direction (1-3, default 1): " clipboard_choice
+        clipboard_choice=${clipboard_choice:-1}
+        case $clipboard_choice in
+            1) clipboard_mode="remote-to-local" ;;
+            2) clipboard_mode="local-to-remote" ;;
+            3) clipboard_mode="bidirectional" ;;
+            *) clipboard_mode="remote-to-local" ;;
+        esac
+    else
+        clipboard_mode="isolated"
+    fi
+
+    read -p "Enable drive redirection? (y/n, default n): " drives
+    drives=${drives:-n}
+
+    # Create new connection object
+    new_connection=$(jq -n \
+        --arg name "$name" \
+        --arg host "$host" \
+        --arg port "$port" \
+        --arg username "$username" \
+        --arg password "$password" \
+        --arg resolution "$resolution" \
+        --arg color_depth "$color_depth" \
+        --arg sound "$sound" \
+        --arg clipboard "$clipboard" \
+        --arg clipboard_mode "$clipboard_mode" \
+        --arg drives "$drives" \
+        --arg perf_mode "$perf_mode" \
+        '{
+            name: $name,
+            host: $host,
+            port: ($port | tonumber),
+            username: $username,
+            password: $password,
+            resolution: $resolution,
+            color_depth: ($color_depth | tonumber),
+            sound: ($sound == "y"),
+            clipboard: ($clipboard == "y"),
+            clipboard_mode: $clipboard_mode,
+            drives: ($drives == "y"),
+            perf_mode: ($perf_mode == "y")
+        }')
+
+    # Add to connections array
+    connections=$(read_connections)
+    updated_connections=$(echo "$connections" | jq ". + [$new_connection]")
+    save_connections "$updated_connections"
+
+    echo -e "${GREEN}Connection '$name' added successfully!${NC}"
+    read -p "Press Enter to continue..."
+}
+
+# Function to list connections
+list_connections() {
+    clear
+    echo -e "${BLUE}=== Saved RDP Connections ===${NC}"
+    echo
+
+    connections=$(read_connections)
+    count=$(echo "$connections" | jq length)
+
+    if [[ $count -eq 0 ]]; then
+        echo -e "${YELLOW}No saved connections found.${NC}"
+        echo
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    echo "$connections" | jq -r '.[] | "\(.name) - \(.host):\(.port) (\(.username // "no username"))"' | nl -w3 -s'. '
+    echo
+    read -p "Press Enter to continue..."
+}
+
+# Function to connect to RDP
+connect_rdp() {
+    connections=$(read_connections)
+    count=$(echo "$connections" | jq length)
+
+    if [[ $count -eq 0 ]]; then
+        clear
+        echo -e "${BLUE}=== Connect to RDP Instance ===${NC}"
+        echo
+        echo -e "${YELLOW}No saved connections found.${NC}"
+        echo
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    local wrapper_path="$FREERDP_WRAPPER"
+    if [[ -z "$wrapper_path" || ! -x "$wrapper_path" ]]; then
+        if command -v freerdp-safe >/dev/null 2>&1; then
+            wrapper_path="$(command -v freerdp-safe)"
+            FREERDP_WRAPPER="$wrapper_path"
+        else
+            clear
+            echo -e "${RED}Cannot locate the freerdp-safe wrapper script.${NC}"
+            echo -e "${YELLOW}Expected it alongside rdp-manager or anywhere in PATH.${NC}"
+            echo
+            echo "Create the alias again after placing both scripts together, or install freerdp-safe system-wide."
+            echo
+            read -p "Press Enter to continue..."
+            return
+        fi
+    fi
+
+    # Build options array for navigation
+    local options=()
+    while IFS= read -r line; do
+        options+=("$line")
+    done < <(echo "$connections" | jq -r '.[] | "\(.name) - \(.host):\(.port)"')
+
+    local selected=0
+    while true; do
+        clear
+        echo -e "${BLUE}=== Connect to RDP Instance ===${NC}"
+        echo
+        echo "Use ↑/↓ arrows to navigate, Enter to select:"
+        echo
+
+        for i in "${!options[@]}"; do
+            if [[ $i -eq $selected ]]; then
+                echo -e "${GREEN}● ${options[i]}${NC}"
+            else
+                echo -e "○ ${options[i]}"
+            fi
+        done
+
+        echo
+
+        # Read key input
+        read -rsn1 key
+        if [[ $key == $'\x1b' ]]; then
+            read -rsn2 key
+            case $key in
+                '[A') # Up arrow
+                    ((selected--))
+                    if [[ $selected -lt 0 ]]; then
+                        selected=$((${#options[@]} - 1))
+                    fi
+                    ;;
+                '[B') # Down arrow
+                    ((selected++))
+                    if [[ $selected -ge ${#options[@]} ]]; then
+                        selected=0
+                    fi
+                    ;;
+            esac
+        elif [[ $key == "" ]]; then # Enter key
+            choice=$((selected + 1))
+            break
+        elif [[ $key =~ ^[1-9]$ ]] && [[ $key -le $count ]]; then # Number key
+            choice=$key
+            break
+        fi
+    done
+
+    # Get selected connection
+    selected=$(echo "$connections" | jq ".[$((choice-1))]")
+
+    name=$(echo "$selected" | jq -r '.name')
+    host=$(echo "$selected" | jq -r '.host')
+    port=$(echo "$selected" | jq -r '.port')
+    username=$(echo "$selected" | jq -r '.username')
+    password=$(echo "$selected" | jq -r '.password')
+    resolution=$(echo "$selected" | jq -r '.resolution')
+    color_depth=$(echo "$selected" | jq -r '.color_depth')
+    sound=$(echo "$selected" | jq -r '.sound')
+    clipboard=$(echo "$selected" | jq -r '.clipboard')
+    local clipboard_mode
+    clipboard_mode=$(echo "$selected" | jq -r '.clipboard_mode // empty')
+    if [[ -z "$clipboard_mode" || "$clipboard_mode" == "null" ]]; then
+        clipboard_mode="isolated"
+    fi
+    drives=$(echo "$selected" | jq -r '.drives')
+    perf_mode=$(echo "$selected" | jq -r '.perf_mode // true')
+
+    # Build clean FreeRDP command with safe wrapper and quality scaling
+    cmd_args=(
+        "$wrapper_path"
+        "/v:$host:$port"
+        "/cert:ignore"
+        "/bpp:$color_depth"
+        "+old-license"
+        "/sec:tls"
+    )
+
+    # Resolution settings with auto-scaling
+    initial_size=""
+    case "$resolution" in
+        "fullscreen")
+            cmd_args+=("/f")
+            ;;
+        "responsive")
+            # Start roughly the size of the invoking Hyprland window, keep dynamic scaling
+            initial_size=$(get_initial_window_size)
+            cmd_args+=("/size:$initial_size")
+            cmd_args+=("/dynamic-resolution")
+            ;;
+        "smart-fullscreen")
+            cmd_args+=("/f")
+            cmd_args+=("/dynamic-resolution")
+            ;;
+        *)
+            # For fixed resolutions, scale the desktop when the window changes
+            cmd_args+=("/size:$resolution")
+            cmd_args+=("/smart-sizing")
+            ;;
+    esac
+
+    # Ensure we have a readable value when displaying the initial size in responsive mode
+    if [[ "$resolution" == "responsive" && -z "$initial_size" ]]; then
+        initial_size=$(get_initial_window_size)
+    fi
+
+    # Performance optimizations
+    if [[ "$perf_mode" == "true" ]]; then
+        cmd_args+=("/network:lan")
+        cmd_args+=("-wallpaper")
+        cmd_args+=("-menu-anims")
+    fi
+
+    # Authentication - use secure credential handling
+    if [[ "$username" != "null" && -n "$username" ]]; then
+        cmd_args+=("/u:$username")
+    fi
+
+    # Use direct password for better compatibility
+    use_stdin_password=false
+    if [[ "$password" != "null" && -n "$password" ]]; then
+        cmd_args+=("/p:$password")
+    fi
+
+    # Additional features
+    if [[ "$sound" == "true" ]]; then
+        cmd_args+=("/sound")
+    fi
+
+    # Configure clipboard handling - isolate by default, allow opt-in sharing
+    local clipboard_status=""
+    local clipboard_share_enabled=false
+    local effective_clipboard_mode="$clipboard_mode"
+    if [[ "$clipboard" != "true" ]]; then
+        effective_clipboard_mode="isolated"
+    fi
+
+    case "$effective_clipboard_mode" in
+        remote-to-local)
+            clipboard_share_enabled=true
+            cmd_args+=("/clipboard")
+            cmd_args+=("/clipboard:files-to:off")
+            cmd_args+=("/clipboard:direction-to:local")
+            clipboard_status="Clipboard sharing enabled (remote → local); file transfers remain disabled"
+            ;;
+        local-to-remote)
+            clipboard_share_enabled=true
+            cmd_args+=("/clipboard")
+            cmd_args+=("/clipboard:files-to:off")
+            cmd_args+=("/clipboard:direction-to:remote")
+            clipboard_status="Clipboard sharing enabled (local → remote)"
+            ;;
+        bidirectional)
+            clipboard_share_enabled=true
+            cmd_args+=("/clipboard")
+            cmd_args+=("/clipboard:files-to:off")
+            cmd_args+=("/clipboard:direction-to:all")
+            clipboard_status="Clipboard sharing enabled in both directions — may impact stability"
+            ;;
+        disabled)
+            cmd_args+=("-clipboard")
+            clipboard_status="Clipboard redirection disabled"
+            effective_clipboard_mode="disabled"
+            ;;
+        isolated|"")
+            cmd_args+=("-clipboard")
+            clipboard_status="Clipboard isolated inside the remote session; host clipboard untouched"
+            effective_clipboard_mode="isolated"
+            ;;
+        *)
+            cmd_args+=("-clipboard")
+            clipboard_status="Clipboard isolated inside the remote session; host clipboard untouched"
+            effective_clipboard_mode="isolated"
+            ;;
+    esac
+
+    if [[ "$drives" == "true" ]]; then
+        cmd_args+=("/drive:home,/home")
+    fi
+
+    # Convert array to command string for display
+    cmd="${cmd_args[*]}"
+
+    echo -e "${GREEN}Connecting to '$name' ($host:$port)...${NC}"
+    echo -e "${BLUE}Command: $cmd${NC}"
+    echo
+
+    # Test connection first (but continue regardless)
+    echo -e "${YELLOW}Testing connection to $host:$port...${NC}"
+    if timeout 5 nc -z "$host" "$port" 2>/dev/null; then
+        echo -e "${GREEN}✓ Port $port is reachable on $host${NC}"
+    else
+        echo -e "${YELLOW}⚠ Cannot reach $host:$port (continuing anyway)${NC}"
+        echo -e "${YELLOW}  This may indicate:${NC}"
+        echo -e "${YELLOW}  • Server is offline or unreachable${NC}"
+        echo -e "${YELLOW}  • Firewall blocking port $port${NC}"
+        echo -e "${YELLOW}  • RDP service not running on target server${NC}"
+    fi
+
+    echo
+    echo -e "${GREEN}Launching FreeRDP...${NC}"
+
+    # Set up clipboard for Hyprland compatibility
+    if [ "$XDG_SESSION_TYPE" = "wayland" ] || [ "$XDG_CURRENT_DESKTOP" = "Hyprland" ]; then
+        echo -e "${YELLOW}FreeRDP with native Wayland clipboard support${NC}"
+        # Force X11 mode for better Wayland compatibility
+        export GDK_BACKEND=x11
+        export QT_QPA_PLATFORM=xcb
+    fi
+
+    if [[ "$resolution" == "fullscreen" || "$resolution" == "smart-fullscreen" ]]; then
+        echo -e "${YELLOW}Starting fullscreen RDP connection...${NC}"
+        echo -e "${YELLOW}✓ Auto-scaling enabled with dynamic resolution${NC}"
+        echo -e "${YELLOW}Use Ctrl+Alt+Enter to exit fullscreen${NC}"
+        if [[ -n "$clipboard_status" ]]; then
+            echo -e "${YELLOW}$clipboard_status${NC}"
+        fi
+        if [[ "$resolution" == "smart-fullscreen" ]]; then
+            monitor_info=$(get_monitor_info)
+            monitor_count=$(echo "$monitor_info" | cut -d',' -f1 | cut -d':' -f2)
+            echo -e "${YELLOW}Smart fullscreen enabled with $monitor_count monitor(s)${NC}"
+        fi
+        # In fullscreen, run directly - all keyboard input goes to RDP
+        # Add error recovery for clipboard crashes
+        if ! "${cmd_args[@]}"; then
+            exit_code=$?
+            if [[ ($exit_code -eq 1 || $exit_code -eq 139) && "$clipboard_share_enabled" == true ]]; then
+                echo -e "${YELLOW}Clipboard crash detected, retrying without host clipboard sharing...${NC}"
+                # Remove clipboard sharing args and retry while keeping isolation flag
+                cmd_args_no_clip=()
+                for arg in "${cmd_args[@]}"; do
+                    case "$arg" in
+                        /clipboard*|+clipboard)
+                            continue
+                            ;;
+                        *)
+                            cmd_args_no_clip+=("$arg")
+                            ;;
+                    esac
+                done
+                echo -e "${YELLOW}Retrying connection with clipboard isolated...${NC}"
+                "${cmd_args_no_clip[@]}"
+                exit_code=$?
+            fi
+        else
+            exit_code=0
+        fi
+    elif [[ "$resolution" == "responsive" ]]; then
+        echo -e "${YELLOW}Starting windowed RDP connection...${NC}"
+        echo -e "${YELLOW}✓ Initial size: $initial_size${NC}"
+        echo -e "${YELLOW}✓ Dynamic resolution enabled (window changes update remote)${NC}"
+        if [[ -n "$clipboard_status" ]]; then
+            echo -e "${YELLOW}$clipboard_status${NC}"
+        fi
+
+        # In responsive mode, allow local Ctrl+C to terminate
+        trap 'echo -e "\n${YELLOW}Terminating RDP connection...${NC}"; exit 0' INT
+        # Add error recovery for clipboard crashes
+        if ! "${cmd_args[@]}"; then
+            exit_code=$?
+            if [[ ($exit_code -eq 1 || $exit_code -eq 139) && "$clipboard_share_enabled" == true ]]; then
+                echo -e "${YELLOW}Clipboard crash detected, retrying without host clipboard sharing...${NC}"
+                # Remove clipboard sharing args and retry while keeping isolation flag
+                cmd_args_no_clip=()
+                for arg in "${cmd_args[@]}"; do
+                    case "$arg" in
+                        /clipboard*|+clipboard)
+                            continue
+                            ;;
+                        *)
+                            cmd_args_no_clip+=("$arg")
+                            ;;
+                    esac
+                done
+                echo -e "${YELLOW}Retrying connection with clipboard isolated...${NC}"
+                "${cmd_args_no_clip[@]}"
+                exit_code=$?
+            fi
+        else
+            exit_code=0
+        fi
+    else
+        echo -e "${YELLOW}Starting windowed RDP connection...${NC}"
+        echo -e "${YELLOW}✓ Auto-scaling enabled with smart sizing${NC}"
+        echo -e "${YELLOW}Press Ctrl+C to terminate, or close window${NC}"
+        if [[ -n "$clipboard_status" ]]; then
+            echo -e "${YELLOW}$clipboard_status${NC}"
+        fi
+
+        # In windowed mode, allow local Ctrl+C to terminate
+        trap 'echo -e "\n${YELLOW}Terminating RDP connection...${NC}"; exit 0' INT
+        # Add error recovery for clipboard crashes
+        if ! "${cmd_args[@]}"; then
+            exit_code=$?
+            if [[ ($exit_code -eq 1 || $exit_code -eq 139) && "$clipboard_share_enabled" == true ]]; then
+                echo -e "${YELLOW}Clipboard crash detected, retrying without host clipboard sharing...${NC}"
+                # Remove clipboard sharing args and retry while keeping isolation flag
+                cmd_args_no_clip=()
+                for arg in "${cmd_args[@]}"; do
+                    case "$arg" in
+                        /clipboard*|+clipboard)
+                            continue
+                            ;;
+                        *)
+                            cmd_args_no_clip+=("$arg")
+                            ;;
+                    esac
+                done
+                echo -e "${YELLOW}Retrying connection with clipboard isolated...${NC}"
+                "${cmd_args_no_clip[@]}"
+                exit_code=$?
+            fi
+        else
+            exit_code=0
+        fi
+    fi
+
+    echo
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "${GREEN}Connection closed normally.${NC}"
+    else
+        echo -e "${RED}Connection failed or closed with error (exit code: $exit_code)${NC}"
+        case $exit_code in
+            1) echo -e "${YELLOW}Reason: Connection failed or authentication error${NC}" ;;
+            2) echo -e "${YELLOW}Reason: Connection refused or host unreachable${NC}" ;;
+            22) echo -e "${YELLOW}Reason: Command line parsing failed (check connection parameters)${NC}" ;;
+            62) echo -e "${YELLOW}Reason: Connection timeout${NC}" ;;
+            64) echo -e "${YELLOW}Reason: Host not found${NC}" ;;
+            131) echo -e "${YELLOW}Reason: Connection interrupted by user${NC}" ;;
+            *) echo -e "${YELLOW}Reason: Unknown error (exit code: $exit_code)${NC}" ;;
+        esac
+
+        echo
+        echo -e "${BLUE}Troubleshooting tips:${NC}"
+        echo -e "• Check if the target server ($host:$port) is reachable"
+        echo -e "• Verify credentials are correct"
+        echo -e "• Ensure RDP service is enabled on target server"
+        echo -e "• Check firewall settings on both client and server"
+        if [[ $exit_code -eq 22 ]]; then
+            echo -e "• Check connection parameters in saved configuration"
+        fi
+    fi
+
+    read -p "Press Enter to continue..."
+}
+
+# Function to edit connection
+edit_connection() {
+    clear
+    echo -e "${BLUE}=== Edit RDP Connection ===${NC}"
+    echo
+
+    connections=$(read_connections)
+    count=$(echo "$connections" | jq length)
+
+    if [[ $count -eq 0 ]]; then
+        echo -e "${YELLOW}No saved connections found.${NC}"
+        echo
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    echo "Available connections:"
+    echo "$connections" | jq -r 'to_entries[] | "\(.key + 1). \(.value.name) - \(.value.host):\(.value.port)"'
+    echo
+
+    while true; do
+        read -p "Choose connection number to edit (1-$count): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le $count ]]; then
+            break
+        else
+            echo -e "${RED}Invalid choice. Please enter a number between 1 and $count.${NC}"
+        fi
+    done
+
+    # Get selected connection
+    selected=$(echo "$connections" | jq ".[$((choice-1))]")
+    index=$((choice-1))
+
+    # Show current values and allow editing
+    echo
+    echo -e "${YELLOW}Current values (press Enter to keep current value):${NC}"
+
+    current_name=$(echo "$selected" | jq -r '.name')
+    read -p "Connection name [$current_name]: " new_name
+    new_name=${new_name:-$current_name}
+
+    current_host=$(echo "$selected" | jq -r '.host')
+    read -p "Host/IP address [$current_host]: " new_host
+    new_host=${new_host:-$current_host}
+
+    current_port=$(echo "$selected" | jq -r '.port')
+    read -p "Port [$current_port]: " new_port
+    new_port=${new_port:-$current_port}
+
+    current_username=$(echo "$selected" | jq -r '.username')
+    if [[ "$current_username" == "null" ]]; then current_username=""; fi
+    read -p "Username [$current_username]: " new_username
+    new_username=${new_username:-$current_username}
+
+    echo "Leave password empty to keep current password"
+    read -s -p "Password: " new_password
+    echo
+    if [[ -z "$new_password" ]]; then
+        new_password=$(echo "$selected" | jq -r '.password')
+    fi
+
+    current_resolution=$(echo "$selected" | jq -r '.resolution')
+    read -p "Resolution [$current_resolution]: " new_resolution
+    new_resolution=${new_resolution:-$current_resolution}
+
+    current_color_depth=$(echo "$selected" | jq -r '.color_depth')
+    read -p "Color depth [$current_color_depth]: " new_color_depth
+    new_color_depth=${new_color_depth:-$current_color_depth}
+
+    current_perf_mode=$(echo "$selected" | jq -r '.perf_mode // true')
+    if [[ "$current_perf_mode" == "true" ]]; then
+        current_perf_display="enabled"
+    else
+        current_perf_display="disabled"
+    fi
+    read -p "Performance mode (y/n) [$current_perf_display]: " new_perf_mode
+    if [[ -z "$new_perf_mode" ]]; then
+        new_perf_mode="$current_perf_mode"
+    elif [[ "$new_perf_mode" =~ ^[Yy]$ ]]; then
+        new_perf_mode="true"
+    else
+        new_perf_mode="false"
+    fi
+
+    # Update the connection
+    current_clipboard_mode=$(echo "$selected" | jq -r '.clipboard_mode // empty')
+    current_clipboard=$(echo "$selected" | jq -r '.clipboard')
+    if [[ "$current_clipboard_mode" == "" || "$current_clipboard_mode" == "null" ]]; then
+        current_clipboard_mode="isolated"
+    fi
+
+    updated_connection=$(jq -n \
+        --arg name "$new_name" \
+        --arg host "$new_host" \
+        --arg port "$new_port" \
+        --arg username "$new_username" \
+        --arg password "$new_password" \
+        --arg resolution "$new_resolution" \
+        --arg color_depth "$new_color_depth" \
+        --arg clipboard_mode "$current_clipboard_mode" \
+        --argjson perf_mode "$new_perf_mode" \
+        --argjson sound "$(echo "$selected" | jq '.sound')" \
+        --argjson clipboard "$(echo "$selected" | jq '.clipboard')" \
+        --argjson drives "$(echo "$selected" | jq '.drives')" \
+        '{
+            name: $name,
+            host: $host,
+            port: ($port | tonumber),
+            username: $username,
+            password: $password,
+            resolution: $resolution,
+            color_depth: ($color_depth | tonumber),
+            perf_mode: $perf_mode,
+            sound: $sound,
+            clipboard: $clipboard,
+            clipboard_mode: $clipboard_mode,
+            drives: $drives
+        }')
+
+    # Update connections array
+    updated_connections=$(echo "$connections" | jq ".[$index] = $updated_connection")
+    save_connections "$updated_connections"
+
+    echo -e "${GREEN}Connection updated successfully!${NC}"
+    read -p "Press Enter to continue..."
+}
+
+# Function to delete connection
+delete_connection() {
+    clear
+    echo -e "${BLUE}=== Delete RDP Connection ===${NC}"
+    echo
+
+    connections=$(read_connections)
+    count=$(echo "$connections" | jq length)
+
+    if [[ $count -eq 0 ]]; then
+        echo -e "${YELLOW}No saved connections found.${NC}"
+        echo
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    echo "Available connections:"
+    echo "$connections" | jq -r 'to_entries[] | "\(.key + 1). \(.value.name) - \(.value.host):\(.value.port)"'
+    echo
+
+    while true; do
+        read -p "Choose connection number to delete (1-$count): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le $count ]]; then
+            break
+        else
+            echo -e "${RED}Invalid choice. Please enter a number between 1 and $count.${NC}"
+        fi
+    done
+
+    # Get connection name for confirmation
+    name=$(echo "$connections" | jq -r ".[$((choice-1))].name")
+
+    echo
+    read -p "Are you sure you want to delete '$name'? (y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # Remove connection from array
+        updated_connections=$(echo "$connections" | jq "del(.[$((choice-1))])")
+        save_connections "$updated_connections"
+        echo -e "${GREEN}Connection '$name' deleted successfully!${NC}"
+    else
+        echo -e "${YELLOW}Deletion cancelled.${NC}"
+    fi
+
+    read -p "Press Enter to continue..."
+}
+
+# Main program loop
+main() {
+    # Check if FreeRDP is installed
+    if ! command -v xfreerdp3 &> /dev/null; then
+        echo -e "${RED}Error: FreeRDP is not installed!${NC}"
+        echo "Please install FreeRDP first:"
+        echo "  Ubuntu/Debian: sudo apt install freerdp2-x11"
+        echo "  Arch Linux: sudo pacman -S freerdp"
+        echo "  CentOS/RHEL: sudo yum install freerdp"
+        exit 1
+    fi
+
+    # Check if jq is installed
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}Error: jq is not installed!${NC}"
+        echo "Please install jq first:"
+        echo "  Ubuntu/Debian: sudo apt install jq"
+        echo "  Arch Linux: sudo pacman -S jq"
+        echo "  CentOS/RHEL: sudo yum install jq"
+        exit 1
+    fi
+
+    migrate_clipboard_modes
+
+    while true; do
+        show_main_menu
+
+        case $choice in
+            1) connect_rdp ;;
+            2) add_connection ;;
+            3) edit_connection ;;
+            4) delete_connection ;;
+            5) list_connections ;;
+            6)
+                echo -e "${GREEN}Goodbye!${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option. Please choose 1-6.${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Run the main program
+main "$@"

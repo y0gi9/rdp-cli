@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# FreeRDP Safe Wrapper - Prevents clipboard crashes and handles errors gracefully
+# This wrapper adds stability improvements to FreeRDP connections
+
+# Colors for output
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+# Function to clean up processes on exit
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 && $exit_code -ne 130 ]]; then
+        echo -e "${YELLOW}Connection terminated with exit code: $exit_code${NC}"
+    fi
+    exit $exit_code
+}
+
+# Resolve FreeRDP binary (prefer newest names but fall back gracefully)
+resolve_freerdp_binary() {
+    local candidates=("xfreerdp3" "xfreerdp" "xfreerdp2")
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Set up signal handlers
+trap cleanup EXIT
+trap 'echo -e "\n${YELLOW}Connection interrupted by user${NC}"; exit 130' INT TERM
+
+# Set environment variables for stability
+export FREERDP_LOG_LEVEL="WARN"
+export FREERDP_LOG_FILTERS="com.freerdp.channels.cliprdr:DEBUG"
+
+# For Wayland compatibility
+if [[ "$XDG_SESSION_TYPE" == "wayland" || "$XDG_CURRENT_DESKTOP" == "Hyprland" ]]; then
+    export GDK_BACKEND=x11
+    export QT_QPA_PLATFORM=xcb
+    export FREERDP_WAYLAND_COMPAT=1
+fi
+
+FREERDP_BIN=$(resolve_freerdp_binary)
+if [[ -z "$FREERDP_BIN" ]]; then
+    echo -e "${RED}Unable to locate a FreeRDP executable (tried xfreerdp3, xfreerdp, xfreerdp2).${NC}"
+    echo -e "${YELLOW}Install FreeRDP or adjust your PATH, then retry.${NC}"
+    exit 127
+fi
+
+echo -e "${GREEN}Starting FreeRDP with enhanced stability via ${FREERDP_BIN}...${NC}"
+
+# Isolate the clipboard unless the caller explicitly overrides it
+freerdp_args=("$@")
+clipboard_overridden=0
+for arg in "${freerdp_args[@]}"; do
+    case "$arg" in
+        +clipboard|/clipboard*)
+            clipboard_overridden=1
+            ;;
+        -clipboard)
+            clipboard_overridden=1
+            ;;
+    esac
+    if [[ $clipboard_overridden -eq 1 ]]; then
+        break
+    fi
+done
+
+if [[ $clipboard_overridden -eq 0 ]]; then
+    freerdp_args+=('-clipboard')
+fi
+
+exec "$FREERDP_BIN" "${freerdp_args[@]}"
